@@ -1,0 +1,381 @@
+diff --git a/backend/src/routes/auth.ts b/backend/src/routes/auth.ts
+index 39be628..a831328 100644
+--- a/backend/src/routes/auth.ts
++++ b/backend/src/routes/auth.ts
+@@ -3,103 +3,138 @@ import bcrypt from 'bcrypt';
+ import jwt from 'jsonwebtoken';
+ import { z } from 'zod';
+ import { appAuth, appDb } from '../db';
++import { buildProfileData, profileSchema } from '../lib/profileSchema';
++import { completeRegistration, saveProfileData } from '../lib/profilePersistence';
+ 
+ export const authRouter = Router();
+ const JWT_SECRET = process.env.JWT_SECRET || 'namma_thittam_secret_key_2026';
+ 
+-const registerSchema = z.object({
++const registerAccountSchema = z.object({
+   username: z.string().min(4).regex(/^[a-zA-Z0-9_]+$/),
+   password: z.string().min(8),
+   security_q1: z.string().min(1), security_a1: z.string().min(1),
+   security_q2: z.string().min(1), security_a2: z.string().min(1),
+   security_q3: z.string().min(1), security_a3: z.string().min(1),
+   security_q4: z.string().min(1), security_a4: z.string().min(1),
+-  full_name: z.string().min(1),
+-  dob: z.string().min(1),
+-  gender: z.enum(['male','female','transgender']),
+-  marital_status: z.string().optional(),
+-  religion: z.string().optional(),
+-  district: z.string().min(1),
+-  area_type: z.enum(['rural','urban','semi_urban']),
+-  social_category: z.enum(['OC','BC','MBC','SC','ST']),
+-  family_size: z.number().optional(),
+-  children_below_18: z.number().optional(),
+-  earning_members: z.number().optional(),
+-  income_annual: z.number().optional(),
+-  ration_card_type: z.string().optional(),
+-  is_bpl: z.boolean().optional(),
+-  occupation: z.string().optional(),
+-  farmer_crop_type: z.string().optional(),
+-  education_level: z.string().optional(),
+-  employment_status: z.string().optional(),
+-  land_holding_acres: z.number().optional(),
+-  land_type: z.string().optional(),
+-  electricity_units_month: z.number().optional(),
+-  house_ownership: z.string().optional(),
+-  vehicle_ownership: z.string().optional(),
+-  has_aadhaar: z.boolean().optional(),
+-  has_jan_dhan_account: z.boolean().optional(),
+-  has_voter_id: z.boolean().optional(),
+-  has_pan: z.boolean().optional(),
+-  is_disabled: z.boolean().optional(),
+-  disability_type: z.string().optional(),
+-  disability_percent: z.number().optional(),
+-  is_widow_orphan_single_parent: z.boolean().optional(),
+-  is_armed_forces_family: z.boolean().optional(),
+-  is_hiv_affected: z.boolean().optional(),
+-  is_migrant_worker: z.boolean().optional(),
+-  is_covid_affected: z.boolean().optional(),
+ });
+ 
+-function omitUndefined<T extends Record<string, any>>(obj: T) {
+-  return Object.fromEntries(Object.entries(obj).filter(([, value]) => value !== undefined));
++function toClientError(err: any) {
++  const message = err?.message || 'Registration failed';
++  if (
++    message.includes('schema cache') ||
++    message.includes("Could not find") ||
++    message.includes('column')
++  ) {
++    return {
++      status: 503,
++      error: 'Database schema is not ready. Run SUPABASE_SCHEMA.sql in the app Supabase project, then restart the backend.',
++      details: message,
++    };
++  }
++
++  if (err?.name === 'ZodError') {
++    return {
++      status: 400,
++      error: err.errors?.[0]?.message || 'Invalid registration details',
++    };
++  }
++
++  return { status: 500, error: message };
+ }
+ 
+ authRouter.post('/register', async (req: Request, res: Response) => {
+   try {
+-    const data = registerSchema.parse(req.body);
+-    
+-    // Check if username taken
+-    const { data: existingUser } = await appDb
++    const accountData = registerAccountSchema.parse(req.body);
++    const profileInput = profileSchema.parse(req.body);
++    const username = accountData.username.trim();
++    const data = { ...accountData, ...profileInput, username };
++    const email = `${username}@nammathittam.local`;
++    let auth_id: string | undefined;
++
++    console.debug('[auth/register] start', { username, email });
++
++    const { data: existingUser, error: existingUserError } = await appDb
+       .from('users')
+-      .select('id')
+-      .eq('username', data.username)
++      .select('id, auth_id, registration_completed_at')
++      .eq('username', username)
+       .single();
+-      
+-    if (existingUser) {
+-      return res.status(400).json({ error: 'Username already taken' });
+-    }
+ 
+-    const email = `${data.username}@nammathittam.local`;
++    if (existingUserError && !existingUser && !existingUserError.message?.includes('No rows found')) {
++      console.warn('[auth/register] users lookup error', existingUserError.message);
++    }
+ 
+-    // Create auth user. If a previous profile setup failed after auth creation,
+-    // sign in with the same credentials and finish creating the app user row.
+-    const { data: authData, error: authError } = await appDb.auth.admin.createUser({
+-      email,
+-      password: data.password,
+-      email_confirm: true
++    console.debug('[auth/register] existingUser', {
++      user: existingUser ? { id: existingUser.id, auth_id: existingUser.auth_id, registration_completed_at: existingUser.registration_completed_at } : null,
++      error: existingUserError?.message
+     });
+ 
+-    let auth_id = authData.user?.id;
+-
+-    if (authError || !auth_id) {
+-      const message = authError?.message || '';
+-      if (!message.toLowerCase().includes('already')) {
+-        throw authError || new Error("Failed to create user");
+-      }
+-
++    if (existingUser) {
+       const { data: existingLogin, error: existingLoginError } = await appAuth.auth.signInWithPassword({
+         email,
+         password: data.password
+       });
+ 
+-      if (existingLoginError || !existingLogin.user) {
+-        throw new Error('Username already exists. Please login or use forgot password.');
++      console.debug('[auth/register] existingLogin', {
++        error: existingLoginError?.message,
++        userId: existingLogin?.user?.id,
++        expectedAuthId: existingUser.auth_id
++      });
++
++      if (
++        existingLoginError ||
++        !existingLogin.user ||
++        existingLogin.user.id !== existingUser.auth_id ||
++        existingUser.registration_completed_at
++      ) {
++        return res.status(400).json({
++          error: existingUser.registration_completed_at
++            ? 'Username already taken'
++            : 'Username is reserved by an unfinished registration. Please login or use forgot password.'
++        });
+       }
+ 
+       auth_id = existingLogin.user.id;
+     }
+ 
++    if (!auth_id) {
++      // Create auth user. If a previous profile setup failed after auth creation,
++      // sign in with the same credentials and finish creating the app user row.
++      const { data: authData, error: authError } = await appDb.auth.admin.createUser({
++        email,
++        password: data.password,
++        email_confirm: true
++      });
++
++      auth_id = authData.user?.id;
++
++      if (authError || !auth_id) {
++        const message = authError?.message || '';
++        console.debug('[auth/register] auth.createUser failed', { message });
++
++        if (!message.toLowerCase().includes('already')) {
++          throw authError || new Error('Failed to create user');
++        }
++
++        const { data: existingLogin, error: existingLoginError } = await appAuth.auth.signInWithPassword({
++          email,
++          password: data.password
++        });
++
++        console.debug('[auth/register] fallback signInWithPassword', {
++          error: existingLoginError?.message,
++          userId: existingLogin?.user?.id
++        });
++
++        if (existingLoginError || !existingLogin.user) {
++          return res.status(400).json({
++            error: 'Username already exists. Please login or use forgot password to recover your account.'
++          });
++        }
++
++        auth_id = existingLogin.user.id;
++      }
++    }
++
+     const saltRounds = 10;
+     const hashedA1 = await bcrypt.hash(data.security_a1, saltRounds);
+     const hashedA2 = await bcrypt.hash(data.security_a2, saltRounds);
+@@ -107,65 +142,30 @@ authRouter.post('/register', async (req: Request, res: Response) => {
+     const hashedA4 = await bcrypt.hash(data.security_a4, saltRounds);
+     const lockedAt = new Date();
+     lockedAt.setDate(lockedAt.getDate() + 30);
+-    const profileData = omitUndefined({
+-      full_name: data.full_name,
+-      dob: data.dob,
+-      gender: data.gender,
+-      marital_status: data.marital_status,
+-      religion: data.religion,
+-      district: data.district,
+-      area_type: data.area_type,
+-      social_category: data.social_category,
+-      family_size: data.family_size,
+-      children_below_18: data.children_below_18,
+-      earning_members: data.earning_members,
+-      income_annual: data.income_annual,
+-      ration_card_type: data.ration_card_type,
+-      is_bpl: data.is_bpl,
+-      has_ration_card: !!data.ration_card_type,
+-      occupation: data.occupation,
+-      farmer_crop_type: data.farmer_crop_type,
+-      education_level: data.education_level,
+-      employment_status: data.occupation === 'unemployed' ? 'unemployed' : data.occupation ? 'employed' : data.employment_status,
+-      land_holding_acres: data.land_holding_acres,
+-      land_type: data.land_type,
+-      electricity_units_month: data.electricity_units_month,
+-      house_ownership: data.house_ownership,
+-      vehicle_ownership: data.vehicle_ownership,
+-      has_aadhaar: data.has_aadhaar,
+-      has_jan_dhan_account: data.has_jan_dhan_account,
+-      has_voter_id: data.has_voter_id,
+-      has_pan: data.has_pan,
+-      is_disabled: data.is_disabled,
+-      disability_type: data.disability_type,
+-      disability_percent: data.disability_percent,
+-      is_widow_orphan_single_parent: data.is_widow_orphan_single_parent,
+-      is_armed_forces_family: data.is_armed_forces_family,
+-      is_hiv_affected: data.is_hiv_affected,
+-      is_migrant_worker: data.is_migrant_worker,
+-      is_covid_affected: data.is_covid_affected,
+-    });
++    const profileData = buildProfileData(profileInput);
+ 
+-    const { error: insertError } = await appDb.from('users').upsert({
++    const { data: appUser, error: insertError } = await appDb.from('users').upsert({
+       auth_id,
+       username: data.username,
+-      ...profileData,
+-      security_q1: data.security_q1,
+-      security_a1_hash: hashedA1,
+-      security_q2: data.security_q2,
+-      security_a2_hash: hashedA2,
+-      security_q3: data.security_q3,
+-      security_a3_hash: hashedA3,
+-      security_q4: data.security_q4,
+-      security_a4_hash: hashedA4,
+       preferred_language: 'ta',
+-      registration_complete: true,
+-      profile_locked_at: lockedAt.toISOString()
+     }, {
+       onConflict: 'auth_id'
+-    });
++    }).select('id').single();
+ 
+     if (insertError) throw insertError;
++    if (!appUser) throw new Error('Failed to create app user');
++
++    const { error: securityError } = await appDb.from('user_security_questions').upsert([
++      { user_id: appUser.id, question_no: 1, question_text: data.security_q1, answer_hash: hashedA1 },
++      { user_id: appUser.id, question_no: 2, question_text: data.security_q2, answer_hash: hashedA2 },
++      { user_id: appUser.id, question_no: 3, question_text: data.security_q3, answer_hash: hashedA3 },
++      { user_id: appUser.id, question_no: 4, question_text: data.security_q4, answer_hash: hashedA4 },
++    ], { onConflict: 'user_id,question_no' });
++
++    if (securityError) throw securityError;
++
++    await saveProfileData(appUser.id, profileData);
++    await completeRegistration(appUser.id, lockedAt.toISOString());
+ 
+     // Login user to get tokens
+     const { data: loginData, error: loginError } = await appAuth.auth.signInWithPassword({
+@@ -183,7 +183,8 @@ authRouter.post('/register', async (req: Request, res: Response) => {
+     });
+ 
+   } catch (err: any) {
+-    return res.status(500).json({ error: err.message });
++    const clientError = toClientError(err);
++    return res.status(clientError.status).json(clientError);
+   }
+ });
+ 
+@@ -202,7 +203,7 @@ authRouter.post('/login', async (req: Request, res: Response) => {
+     }
+ 
+     const { data: userData } = await appDb
+-      .from('users')
++      .from('user_registration_profiles')
+       .select('registration_complete')
+       .eq('auth_id', loginData.user.id)
+       .single();
+@@ -231,17 +232,32 @@ authRouter.post('/refresh', async (req: Request, res: Response) => {
+ 
+ authRouter.get('/security-questions/:username', async (req: Request, res: Response) => {
+   try {
+-    const { data, error } = await appDb
++    const { data: user, error: userError } = await appDb
+       .from('users')
+-      .select('security_q1, security_q2, security_q3, security_q4')
++      .select('id')
+       .eq('username', req.params.username)
+       .single();
+ 
+-    if (error || !data) {
++    if (userError || !user) {
+       return res.status(404).json({ error: 'User not found' });
+     }
+ 
+-    return res.json(data);
++    const { data: questions, error } = await appDb
++      .from('user_security_questions')
++      .select('question_no, question_text')
++      .eq('user_id', user.id)
++      .order('question_no', { ascending: true });
++
++    if (error || !questions || questions.length < 4) {
++      return res.status(404).json({ error: 'Security questions not found' });
++    }
++
++    return res.json({
++      security_q1: questions[0].question_text,
++      security_q2: questions[1].question_text,
++      security_q3: questions[2].question_text,
++      security_q4: questions[3].question_text,
++    });
+   } catch (err: any) {
+     return res.status(500).json({ error: err.message });
+   }
+@@ -253,7 +269,7 @@ authRouter.post('/forgot-password/verify', async (req: Request, res: Response) =
+     
+     const { data: user, error } = await appDb
+       .from('users')
+-      .select('auth_id, security_a1_hash, security_a2_hash, security_a3_hash, security_a4_hash')
++      .select('id, auth_id')
+       .eq('username', username)
+       .single();
+ 
+@@ -261,10 +277,20 @@ authRouter.post('/forgot-password/verify', async (req: Request, res: Response) =
+       return res.status(401).json({ error: 'a«¬a«ña«+a«¦a»ìa«òa«¦a»ì a«Üa«¦a«+a«»a«+a«¦a»ìa«¦a»ê. a««a»Ça«úa»ìa«ƒa»üa««a»ì a««a»üa«»a«¦a»ìa«Üa«+a«òa»ìa«òa«¦a»üa««a»ì.' });
+     }
+ 
+-    const m1 = await bcrypt.compare(security_a1, user.security_a1_hash);
+-    const m2 = await bcrypt.compare(security_a2, user.security_a2_hash);
+-    const m3 = await bcrypt.compare(security_a3, user.security_a3_hash);
+-    const m4 = await bcrypt.compare(security_a4, user.security_a4_hash);
++    const { data: answers, error: answersError } = await appDb
++      .from('user_security_questions')
++      .select('question_no, answer_hash')
++      .eq('user_id', user.id)
++      .order('question_no', { ascending: true });
++
++    if (answersError || !answers || answers.length < 4) {
++      return res.status(401).json({ error: 'Security answers are not available. Please contact support.' });
++    }
++
++    const m1 = await bcrypt.compare(security_a1, answers[0].answer_hash);
++    const m2 = await bcrypt.compare(security_a2, answers[1].answer_hash);
++    const m3 = await bcrypt.compare(security_a3, answers[2].answer_hash);
++    const m4 = await bcrypt.compare(security_a4, answers[3].answer_hash);
+ 
+     if (!m1 || !m2 || !m3 || !m4) {
+       return res.status(401).json({ error: 'a«¬a«ña«+a«¦a»ìa«òa«¦a»ì a«Üa«¦a«+a«»a«+a«¦a»ìa«¦a»ê. a««a»Ça«úa»ìa«ƒa»üa««a»ì a««a»üa«»a«¦a»ìa«Üa«+a«òa»ìa«òa«¦a»üa««a»ì.' });
+

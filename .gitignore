@@ -1,0 +1,10 @@
+backend/.env
+backend/*.log
+govt-api-service/.env
+govt-api-service/*.log
+app/.env
+app/.expo/
+app/dist/
+app/node_modules/
+app/*.log
+app/.git-backup/
